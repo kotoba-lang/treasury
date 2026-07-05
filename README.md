@@ -1,5 +1,7 @@
 # treasury
 
+[![CI](https://github.com/kotoba-lang/treasury/actions/workflows/ci.yml/badge.svg)](https://github.com/kotoba-lang/treasury/actions/workflows/ci.yml)
+
 **Domain-agnostic USDC payment quoting + on-chain verification + append-only
 ledger entries, in pure Clojure/ClojureScript (`.cljc`).**
 
