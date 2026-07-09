@@ -21,13 +21,24 @@
 (def chains
   {"ethereum" {:chain "ethereum" :usdc "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
                :explorer-api "https://api.etherscan.io/api"
+               :rpc "https://ethereum-rpc.publicnode.com"
                :fee-hint "gas 高め（$数）— 少額決済には L2 推奨"}
    "base"     {:chain "base" :usdc "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
                :explorer-api "https://api.basescan.org/api"
+               ;; keyless JSON-RPC verify path (receipt->onchain). Preferred over
+               ;; the explorer API — Basescan V1 is deprecated and Etherscan V2
+               ;; requires a PAID plan for Base (chainid 8453). Base's public RPC
+               ;; is keyless + free (ADR-2607093100 verify-path robustness).
+               :rpc "https://mainnet.base.org"
                :fee-hint "gas 数セント — 少額決済向き"}
    "arbitrum" {:chain "arbitrum" :usdc "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
                :explorer-api "https://api.arbiscan.io/api"
+               :rpc "https://arbitrum-one-rpc.publicnode.com"
                :fee-hint "gas 安い"}})
+
+;; keccak256("Transfer(address,address,uint256)")
+(def transfer-topic
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
 (def default-chain "ethereum")
 (defn chain-cfg [chain] (get chains (or chain default-chain) (get chains default-chain)))
@@ -184,3 +195,63 @@
      :confirmations (or (some-> (g "confirmations") str parse-long) 0)
      :asset (g "tokenSymbol")
      :tx (g "hash")}))
+
+;; ── keyless JSON-RPC verify path (no explorer API) ─────────────────────────
+;; The host fetches eth_getTransactionReceipt (the tx) and eth_blockNumber (the
+;; head) from the chain's public :rpc and passes both here. Pure parsing of the
+;; USDC Transfer log → the same on-chain record etherscan-row->onchain yields,
+;; so verify-payment is unchanged. Survives Basescan V1 deprecation + avoids
+;; Etherscan V2's paid-plan requirement for Base.
+
+(defn- hex->long
+  "Parse a 0x-prefixed hex string to a long (nil on blank/garbage). USDC micros
+   stay well under 2^53 so long is safe for amounts and block numbers."
+  [h]
+  (let [s (some-> h str str/lower-case (str/replace #"^0x" ""))]
+    (when (and s (not= s "") (re-matches #"[0-9a-f]+" s))
+      #?(:clj (Long/parseLong s 16)
+         :cljs (js/parseInt s 16)))))
+
+(defn- topic->address
+  "A 32-byte log topic (0x + 24 zero-bytes + 20-byte address) → 0x<40hex> addr."
+  [topic]
+  (let [s (some-> topic str str/lower-case (str/replace #"^0x" ""))]
+    (when (and s (>= (count s) 40))
+      (str "0x" (subs s (- (count s) 40))))))
+
+(defn receipt->onchain
+  "Parse an eth_getTransactionReceipt result + the current head block number
+   into the on-chain record verify-payment expects, for the USDC Transfer to
+   the treasury. Pure — the RPC I/O is the host's. Returns nil when the tx
+   reverted or carries no matching USDC Transfer log.
+     receipt      : {\"status\" \"0x1\" \"blockNumber\" \"0x…\"
+                     \"transactionHash\" \"0x…\"
+                     \"logs\" [{\"address\" \"0x…\" \"topics\" [t0 from to] \"data\" \"0x…\"}]}
+     current-block: integer head block (from eth_blockNumber)
+     usdc-contract: the chain's USDC address"
+  [receipt current-block usdc-contract]
+  (let [g #(or (get receipt %) (get receipt (keyword %)))
+        status (g "status")
+        logs (or (g "logs") [])
+        usdc (str/lower-case (str usdc-contract))
+        tx-block (hex->long (g "blockNumber"))
+        transfer (some (fn [lg]
+                         (let [la #(or (get lg %) (get lg (keyword %)))
+                               topics (or (la "topics") [])]
+                           (when (and (= (str/lower-case (str (la "address"))) usdc)
+                                      (= (str/lower-case (str (first topics))) transfer-topic)
+                                      (>= (count topics) 3))
+                             lg)))
+                       logs)]
+    (when (and transfer
+               ;; success only ("0x1"); "0x0" = reverted → nil (cannot confirm)
+               (contains? #{"0x1" 1 "0x01"} status)
+               tx-block current-block)
+      (let [la #(or (get transfer %) (get transfer (keyword %)))
+            topics (la "topics")
+            raw (or (hex->long (la "data")) 0)]
+        {:to (topic->address (nth topics 2))
+         :amount (/ (double raw) (Math/pow 10 6))     ; USDC 6 decimals
+         :confirmations (max 0 (inc (- current-block tx-block)))
+         :asset "USDC"
+         :tx (g "transactionHash")}))))

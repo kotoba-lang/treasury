@@ -80,3 +80,35 @@
            (t/etherscan-row->onchain
             {"to" "0xSAFE" "value" "10000000" "tokenDecimal" "6"
              "confirmations" "12" "tokenSymbol" "USDC" "hash" "0xTX"})))))
+
+(def usdc "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+(def transfer-topic "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
+(defn- usdc-log [to data-hex]
+  {"address" usdc
+   "topics" [transfer-topic
+             "0x000000000000000000000000aaaa000000000000000000000000000000000001" ; from
+             (str "0x000000000000000000000000" (subs to 2))]                      ; to (padded)
+   "data" data-hex})
+
+(deftest receipt->onchain-test
+  (let [treasury "0xbbbb000000000000000000000000000000000002"
+        receipt {"status" "0x1" "blockNumber" "0x64" "transactionHash" "0xTX"
+                 "logs" [(usdc-log treasury "0x7a120")]}]                         ; 500000 = 0.5 USDC
+    (testing "parses a successful USDC Transfer receipt via RPC (keyless path)"
+      (is (= {:to treasury :amount 0.5 :confirmations 4 :asset "USDC" :tx "0xTX"}
+             (t/receipt->onchain receipt 103 usdc))))                            ; head 103, block 100 → 4 conf
+    (testing "reverted tx (status 0x0) → nil, cannot confirm"
+      (is (nil? (t/receipt->onchain (assoc receipt "status" "0x0") 103 usdc))))
+    (testing "no USDC Transfer log → nil"
+      (is (nil? (t/receipt->onchain {"status" "0x1" "blockNumber" "0x64" "logs" []} 103 usdc))))
+    (testing "a non-USDC contract log is ignored → nil"
+      (is (nil? (t/receipt->onchain
+                 {"status" "0x1" "blockNumber" "0x64"
+                  "logs" [(assoc (usdc-log treasury "0x7a120") "address" "0xdeadbeef")]}
+                 103 usdc))))
+    (testing "the parsed record flows through verify-payment unchanged"
+      (let [pending (t/pending-entry :x402 "0xagent" 0.5 "0xTX" "base")
+            onchain (t/receipt->onchain receipt 200 usdc)]
+        (is (:ok? (t/verify-payment pending onchain
+                                    {:treasury treasury :fee-frac 0.0 :min-confirmations 3})))))))
