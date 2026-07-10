@@ -203,14 +203,39 @@
 ;; so verify-payment is unchanged. Survives Basescan V1 deprecation + avoids
 ;; Etherscan V2's paid-plan requirement for Base.
 
-(defn- hex->long
+(defn hex->long
   "Parse a 0x-prefixed hex string to a long (nil on blank/garbage). USDC micros
-   stay well under 2^53 so long is safe for amounts and block numbers."
+   stay well under 2^53 so long is safe for amounts and block numbers. Public
+   so callers parsing an eth_blockNumber RPC result (the `current-block` arg
+   to receipt->onchain below) use this validating parser instead of a raw
+   js/parseInt, which silently yields NaN on malformed/missing RPC output
+   instead of nil."
   [h]
   (let [s (some-> h str str/lower-case (str/replace #"^0x" ""))]
     (when (and s (not= s "") (re-matches #"[0-9a-f]+" s))
       #?(:clj (Long/parseLong s 16)
          :cljs (js/parseInt s 16)))))
+
+(defn- finite-number?
+  "true for a real, non-NaN number. NaN is truthy in Clojure/ClojureScript's
+   `if`/`and`/`when` (only nil/false are falsy) and NaN comparisons
+   (`<`/`>`/`>=`/`<=`) are always false -- an un-validated NaN silently
+   passes any `(and ... x)` truthiness gate yet defeats any numeric bound
+   check downstream. receipt->onchain guards `current-block` with this
+   because it is EXTERNAL I/O-derived (a caller-supplied eth_blockNumber
+   result) and a caller might not use hex->long to parse it.
+
+   NOT `(= x x)` -- that idiom reliably catches NaN on :cljs, but on :clj a
+   boxed Double NaN passed through a function boundary compares `.equals`
+   (which Java specifically defines as NaN.equals(NaN) => true), not IEEE754
+   `==` (NaN == NaN => false) -- `(= x x)` silently returns true for NaN
+   there instead of false, confirmed empirically against a real JVM (a
+   top-level `(let [x Double/NaN] (= x x))` returns false, but the exact
+   same value routed through a fn argument returns true). Double/isNaN
+   sidesteps this entirely."
+  [x]
+  (and (number? x) #?(:clj (not (Double/isNaN (double x)))
+                       :cljs (not (js/isNaN x)))))
 
 (defn- topic->address
   "A 32-byte log topic (0x + 24 zero-bytes + 20-byte address) → 0x<40hex> addr."
@@ -246,7 +271,16 @@
     (when (and transfer
                ;; success only ("0x1"); "0x0" = reverted → nil (cannot confirm)
                (contains? #{"0x1" 1 "0x01"} status)
-               tx-block current-block)
+               tx-block
+               ;; NOT just `current-block` -- a NaN current-block (e.g. a
+               ;; caller that parsed a failed/malformed eth_blockNumber RPC
+               ;; result with a raw js/parseInt instead of hex->long) is
+               ;; truthy here and would otherwise flow into :confirmations
+               ;; below as NaN, silently defeating verify-payment's
+               ;; `(< confs min-confirmations)` guard (NaN < n is always
+               ;; false), so an unconfirmed payment could be accepted as
+               ;; confirmed.
+               (finite-number? current-block))
       (let [la #(or (get transfer %) (get transfer (keyword %)))
             topics (la "topics")
             raw (or (hex->long (la "data")) 0)]
