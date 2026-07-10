@@ -49,12 +49,26 @@
     (testing "rejects insufficient confirmations"
       (is (= :insufficient-confirmations
              (:reason (t/verify-payment pending {:to "0xSAFE" :amount 10 :confirmations 1} opts)))))
-    (testing "confirms on correct recipient/amount/confirmations (case-insensitive address match)"
-      (let [result (t/verify-payment pending {:to "0xsafe" :amount 10 :confirmations 3} opts)]
+    (testing "confirms on correct recipient/amount/confirmations/asset (case-insensitive address+asset match)"
+      (let [result (t/verify-payment pending {:to "0xsafe" :amount 10 :confirmations 3 :asset "usdc"} opts)]
         (is (:ok? result))
         (is (= :confirmed (:reason result)))
         (is (= :topup (:run/for (:entry result))))
-        (is (= 9.5 (:treasury/net (:entry result))))))))
+        (is (= 9.5 (:treasury/net (:entry result))))))
+    (testing "CONFIRMED BUG regression: rejects a wrong asset even when recipient/amount/
+              confirmations are all correct -- a payment in a worthless/fake token (e.g.
+              etherscan-row->onchain's unfiltered tokenSymbol) must never be confirmed as
+              a genuine USDC payment just because the amount/recipient numerically match"
+      (is (= :wrong-asset
+             (:reason (t/verify-payment pending
+                                        {:to "0xSAFE" :amount 10 :confirmations 5 :asset "SCAMCOIN"}
+                                        opts)))))
+    (testing "rejects a missing asset too -- an onchain record that doesn't self-report a
+              token type must fail closed, not be trusted by default"
+      (is (= :wrong-asset
+             (:reason (t/verify-payment pending
+                                        {:to "0xSAFE" :amount 10 :confirmations 5}
+                                        opts)))))))
 
 (deftest pending-payments-test
   (testing "a pending tx with no matching confirmed entry still shows as pending"

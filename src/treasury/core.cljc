@@ -127,8 +127,19 @@
                (nil = tx not found yet -> not confirmed)
      opts    : {:treasury <addr> :fee-frac <n> :min-confirmations <n>}
    -> {:ok? bool :reason kw :entry <confirmed-entry when ok>}. Wrong recipient
-   / underpaid / too few confirmations all reject — a fake or insufficient tx
-   cannot confirm."
+   / underpaid / too few confirmations / wrong (or missing) asset all reject —
+   a fake or insufficient tx cannot confirm.
+
+   The :asset check exists because onchain's two real producers differ in how
+   trustworthy their :asset is: receipt->onchain only matches a Transfer log
+   whose contract address equals the chain's real USDC contract, so its
+   :asset is always genuinely \"USDC\"; but etherscan-row->onchain copies
+   whatever tokenSymbol string is in the explorer-API row verbatim, which is
+   attacker-chosen ERC-20 metadata, not chain-enforced identity -- a payer
+   could send a worthless token whose symbol happens to be \"USDC\", or any
+   token at all if this check didn't exist. Confirmed bug this closes: the
+   :asset field this docstring has always documented onchain as carrying was
+   never actually read anywhere in this function."
   [pending onchain {:keys [treasury fee-frac min-confirmations]
                     :or {min-confirmations min-confirmations}}]
   (let [pay (run-payment pending)
@@ -139,6 +150,7 @@
         to (or (:to onchain) (get onchain "to"))
         amount (or (:amount onchain) (get onchain "amount") 0)
         confs (or (:confirmations onchain) (get onchain "confirmations") 0)
+        asset (or (:asset onchain) (get onchain "asset"))
         tx (or (:tx pay) (get pay "tx"))
         chain (or (:chain pay) (get pay "chain") default-chain)]
     (cond
@@ -147,6 +159,8 @@
       (< (double amount) (double (* want-usd usdc-per-usd)))
                                     {:ok? false :reason :underpaid}
       (< confs min-confirmations)  {:ok? false :reason :insufficient-confirmations}
+      (not= (lc asset) (lc (:asset crypto-asset)))
+                                    {:ok? false :reason :wrong-asset}
       :else {:ok? true :reason :confirmed
              :entry (confirmed-entry kind did want-usd fee-frac tx chain)})))
 
