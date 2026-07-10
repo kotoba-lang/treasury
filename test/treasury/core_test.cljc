@@ -111,4 +111,14 @@
       (let [pending (t/pending-entry :x402 "0xagent" 0.5 "0xTX" "base")
             onchain (t/receipt->onchain receipt 200 usdc)]
         (is (:ok? (t/verify-payment pending onchain
-                                    {:treasury treasury :fee-frac 0.0 :min-confirmations 3})))))))
+                                    {:treasury treasury :fee-frac 0.0 :min-confirmations 3})))))
+    (testing "a NaN current-block (e.g. from a caller's raw js/parseInt on a
+              failed/malformed eth_blockNumber RPC result) is rejected as
+              nil instead of silently flowing into :confirmations as NaN --
+              NaN is truthy in `and`/`when` and NaN < n is always false, so
+              an un-guarded NaN would otherwise defeat verify-payment's
+              min-confirmations check and accept an unconfirmed payment"
+      #?(:cljs
+         (is (nil? (t/receipt->onchain receipt js/NaN usdc)))
+         :clj
+         (is (nil? (t/receipt->onchain receipt Double/NaN usdc)))))))
