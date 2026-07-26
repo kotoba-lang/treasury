@@ -136,3 +136,39 @@
          (is (nil? (t/receipt->onchain receipt js/NaN usdc)))
          :clj
          (is (nil? (t/receipt->onchain receipt Double/NaN usdc)))))))
+
+;; ══ a contract recipient exists only where it was deployed (2026-07-26) ══
+;; The old chains comment advised moving the rail to a cheaper L2 without changing
+;; the recipient, on the grounds that a Safe's address is the same across chains.
+;; A real Safe disproved the safety of that: deployed on Ethereum, NO CODE on BSC,
+;; Avalanche, Base, Polygon, Arbitrum or Optimism.
+
+(deftest contract-deployed?-reads-eth-getCode
+  (is (true? (t/contract-deployed? "0x6080604052")))
+  (is (false? (t/contract-deployed? "0x")) "empty = nothing on THIS chain")
+  (is (false? (t/contract-deployed? nil))))
+
+(deftest code-request-is-data-only
+  (is (= {:jsonrpc "2.0" :id 1 :method "eth_getCode"
+          :params ["0x640404B566D34c401996eBb360F40BC4cECFA881" "latest"]}
+         (t/code-request "0x640404B566D34c401996eBb360F40BC4cECFA881"))))
+
+(deftest safe-recipient-on-a-chain-without-code-is-refused
+  (let [safe {:address "0x640404B566D34c401996eBb360F40BC4cECFA881" :chain "base"}
+        {:keys [ok? problem]} (t/verify-recipient-deployed safe "0x")]
+    (is (false? ok?))
+    (is (= :recipient-has-no-code problem)
+        "USDC sent here would be unrecoverable by anyone")))
+
+(deftest safe-recipient-on-its-own-chain-passes
+  (let [safe {:address "0x640404B566D34c401996eBb360F40BC4cECFA881" :chain "ethereum"}]
+    (is (:ok? (t/verify-recipient-deployed safe "0x608060405273")))))
+
+(deftest an-eoa-recipient-must-be-declared-as-one
+  (testing "an EOA legitimately has no code, but the caller has to say so"
+    (is (:ok? (t/verify-recipient-deployed
+               {:address "0xabc" :chain "base" :expect-contract? false} "0x")))
+    (is (= :recipient-unexpectedly-a-contract
+           (:problem (t/verify-recipient-deployed
+                      {:address "0xabc" :chain "base" :expect-contract? false}
+                      "0x6080"))))))
