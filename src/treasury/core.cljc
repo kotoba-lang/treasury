@@ -14,9 +14,23 @@
   (:require [clojure.string :as str]))
 
 ;; ── chains ───────────────────────────────────────────────────────────────
-;; USDC contract + block-explorer API per EVM chain. A Safe's address is the
-;; same across chains (CREATE2), so switching `chain` moves the rail to a
-;; cheaper L2 without changing the recipient.
+;; USDC contract + block-explorer API per EVM chain.
+;;
+;; ⚠ DO NOT ASSUME A SAFE EXISTS ON A CHAIN JUST BECAUSE ITS ADDRESS IS FREE
+;; THERE. This comment used to say a Safe's address is the same across chains
+;; (CREATE2), so switching `chain` moved the rail to a cheaper L2 without
+;; changing the recipient. The first half is often true and the CONCLUSION IS
+;; DANGEROUS: a Safe is a CONTRACT, deployed per chain. The address being
+;; unoccupied elsewhere does not mean a Safe is deployed there, and USDC sent to
+;; an address with no code is not recoverable by anyone.
+;;
+;; Measured 2026-07-26 on a real Safe (0x640404B5…A881): deployed on Ethereum
+;; mainnet (v1.4.1), and `eth_getCode` returns EMPTY on BSC, Avalanche, Base,
+;; Polygon, Arbitrum and Optimism. Routing that recipient to an L2 on the strength
+;; of the old comment would have burned the funds.
+;;
+;; So `verify-recipient-deployed` below must pass before a treasury address is used
+;; on a chain it has not already received on.
 
 (def chains
   {"ethereum" {:chain "ethereum" :usdc "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -46,6 +60,50 @@
 (def crypto-asset {:asset "USDC" :decimals 6 :custody "safe-multisig"})
 (def usdc-per-usd 1)
 (def min-confirmations 3)
+
+;; ── recipient safety ──────────────────────────────────────────────────────
+
+(defn code-request
+  "An `eth_getCode` JSON-RPC request for `address`, as data (this library performs
+  no I/O — the caller supplies the transport).
+
+  Use it before trusting a treasury address on a chain it has not received on
+  before. A Safe or any other contract recipient exists ONLY where it was
+  deployed; funds sent to an address with no code on that chain are unrecoverable."
+  [address]
+  {:jsonrpc "2.0" :id 1 :method "eth_getCode" :params [address "latest"]})
+
+(defn contract-deployed?
+  "Does an `eth_getCode` result indicate deployed code? An empty result (0x, or
+  nil) means the address is an EOA or nothing at all ON THIS CHAIN."
+  [code-result]
+  (boolean (and code-result
+                (string? code-result)
+                (> (count (str/replace code-result #"^0x" "")) 0))))
+
+(defn verify-recipient-deployed
+  "Check that a contract treasury recipient actually exists on the chain it is
+  about to be paid on. Returns `{:ok? true}` or
+  `{:ok? false :problem :recipient-has-no-code …}`.
+
+  `expect-contract?` is the caller's own statement about what the recipient IS. A
+  Safe/multisig must be a contract, so a missing code result is fatal. A plain EOA
+  recipient legitimately has no code, and passing `false` says so explicitly rather
+  than letting the check silently pass for both cases."
+  [{:keys [address chain expect-contract?] :or {expect-contract? true}} code-result]
+  (let [deployed? (contract-deployed? code-result)]
+    (cond
+      (and expect-contract? (not deployed?))
+      {:ok? false :problem :recipient-has-no-code :address address :chain chain
+       :note (str "no contract code at this address on " chain
+                  " — a Safe is deployed PER CHAIN, and funds sent to an address"
+                  " with no code there cannot be moved by anyone")}
+
+      (and (not expect-contract?) deployed?)
+      {:ok? false :problem :recipient-unexpectedly-a-contract :address address :chain chain
+       :note "caller said EOA but this address has code; confirm what it is"}
+
+      :else {:ok? true :deployed? deployed?})))
 
 ;; ── fee split (pure pricing primitive — no unit conversion) ────────────────
 
