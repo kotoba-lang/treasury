@@ -361,3 +361,149 @@
          :confirmations (max 0 (inc (- current-block tx-block)))
          :asset "USDC"
          :tx (g "transactionHash")}))))
+
+;; ── materialized view: USDC transfers to a watched address ──────────────
+;;
+;; com-junkawasaki/root ADR-2608010000. `receipt->onchain` answers ONE question
+;; by asking a chain node about ONE transaction; every verification is a live
+;; dependency on an RPC endpoint. That dependency failed in production
+;; 2026-08-01 (Cloudflare egress rate-limited by every public Base RPC) and the
+;; failure was reported to the payer as "your transaction does not exist".
+;;
+;; The alternative is not to hold the chain — full Base archive grows ~500 GB
+;; per week, which is unbounded. It is to hold a VIEW: the confirmed USDC
+;; Transfers into addresses we actually watch. That is bounded by our own
+;; payment count, not by chain activity, and it is derived from LOGS rather
+;; than state, which is the cheap half of a node's job.
+;;
+;; The view is content-addressed and therefore memoizable forever: a view over
+;; a fixed block range never changes, so a digest of it is a stable key and
+;; there is no invalidation path to get wrong (ADR-2607310900's property).
+;;
+;; THE INVARIANT THAT MATTERS MOST: a view knows a block RANGE, and a question
+;; about a transaction outside that range is :not-covered — NEVER :not-found.
+;; Collapsing those is the same defect class already fixed once on this path
+;; (an RPC failure reported as :tx-not-found), and it is worse here, because a
+;; view is by construction incomplete.
+
+(defn logs->view
+  "Raw `eth_getLogs` results → a materialized view of confirmed USDC Transfers
+   into `watched` addresses. Ingest-agnostic: the caller fetched these logs from
+   a node, a relay, an archive, wherever — this is pure.
+
+     logs    : [{\"address\" \"0x…\" \"topics\" [t0 from to] \"data\" \"0x…\"
+                 \"blockNumber\" \"0x…\" \"transactionHash\" \"0x…\"}]
+     opts    : {:chain \"base\" :watched #{addr…} :from-block n :to-block n}
+
+   → {:chain :from-block :to-block :watched #{…} :entries [{…}]}
+
+   Only logs on the chain's REAL USDC contract and carrying the canonical
+   Transfer topic are admitted, so a worthless token whose symbol happens to be
+   \"USDC\" contributes nothing — the same reasoning `verify-payment`'s :asset
+   check exists for, applied at ingest instead of at decision time."
+  [logs {:keys [chain watched from-block to-block]}]
+  (let [usdc (str/lower-case (str (:usdc (chain-cfg chain))))
+        watched (into #{} (map #(str/lower-case (str %))) watched)
+        entries (->> logs
+                     (keep (fn [lg]
+                             (let [g #(or (get lg %) (get lg (keyword %)))
+                                   topics (or (g "topics") [])
+                                   to (some-> (nth topics 2 nil) topic->address)]
+                               (when (and (= (str/lower-case (str (g "address"))) usdc)
+                                          (= (str/lower-case (str (first topics))) transfer-topic)
+                                          (>= (count topics) 3)
+                                          (contains? watched to))
+                                 {:tx (str/lower-case (str (g "transactionHash")))
+                                  :block (hex->long (g "blockNumber"))
+                                  :from (topic->address (nth topics 1))
+                                  :to to
+                                  :micros (or (hex->long (g "data")) 0)}))))
+                     (filter :block)
+                     ;; canonical order so the digest is deterministic
+                     (sort-by (juxt :block :tx :from :micros))
+                     vec)]
+    {:chain chain :watched watched
+     :from-block from-block :to-block to-block
+     :entries entries}))
+
+(defn view-digest
+  "A stable content address for `view`. Two views over the same range with the
+   same entries digest identically regardless of the order the logs arrived in
+   (logs->view canonicalises), which is what makes this usable as a memo key.
+
+   Deliberately a plain string built from the canonical fields rather than a
+   cryptographic hash: this library is zero-dep and runs on the JVM, in a
+   Worker and under nbb, and a caller who wants a CID can hash this. What
+   matters here is that the identity is CANONICAL, not that it is short."
+  [{:keys [chain from-block to-block watched entries]}]
+  (str "usdc-transfer-view/v1:" chain
+       ":" from-block "-" to-block
+       ":" (str/join "," (sort watched))
+       ":" (count entries)
+       ":" (str/join "|" (map #(str (:block %) "," (:tx %) "," (:from %) "," (:micros %)) entries))))
+
+(defn view-covers?
+  "Does `view` cover `block`? A nil block is not covered — an unknown position
+   cannot be inside a known range."
+  [{:keys [from-block to-block]} block]
+  (boolean (and (number? block) (number? from-block) (number? to-block)
+                (<= from-block block to-block))))
+
+(defn view-lookup
+  "Find the entry for `tx` in `view`.
+   → {:status :found :entry {…}} | {:status :not-in-view}
+
+   `:not-in-view` deliberately does NOT say :not-found. Whether that means the
+   transfer does not exist, or merely that this view does not cover it, is a
+   question only `view-covers?` can answer — and it needs the tx's block, which
+   is exactly what we do not have when we cannot find it. The caller must treat
+   :not-in-view as INCONCLUSIVE unless it has independent evidence of the
+   block."
+  [{:keys [entries]} tx]
+  (let [t (some-> tx str str/lower-case)]
+    (if-let [e (first (filter #(= (:tx %) t) entries))]
+      {:status :found :entry e}
+      {:status :not-in-view})))
+
+(defn verify-from-view
+  "Verify a payment against a materialized view instead of a live chain query.
+
+     view      from logs->view
+     opts      {:tx :treasury :usd :head-block :min-confirmations}
+
+   → {:ok? bool :reason kw :onchain {…}}
+
+   `:reason` distinguishes THREE outcomes that must never be collapsed:
+     :confirmed      the view has it and it satisfies the requirements
+     :not-in-view    the view does not contain it — INCONCLUSIVE, ask a node
+     :underpaid / :wrong-recipient / :insufficient-confirmations
+                     the view has it and it FAILS — conclusive, do not re-ask
+
+   The middle one is the whole point. A view is incomplete by construction, so
+   `absent from my index` is not evidence about the chain. Answering
+   :tx-not-found there would tell someone who has paid that their payment does
+   not exist — the exact production defect this design exists to remove."
+  [view {:keys [tx treasury usd head-block min-confirmations]
+         :or {min-confirmations min-confirmations}}]
+  (let [{:keys [status entry]} (view-lookup view tx)]
+    (if (= :not-in-view status)
+      {:ok? false :reason :not-in-view}
+      (let [confs (if (and (number? head-block) (number? (:block entry)))
+                    (max 0 (inc (- head-block (:block entry))))
+                    0)
+            onchain {:to (:to entry)
+                     :amount (/ (double (:micros entry)) (Math/pow 10 6))
+                     :confirmations confs
+                     :asset "USDC"
+                     :tx (:tx entry)}]
+        (cond
+          (not= (str/lower-case (str (:to entry))) (str/lower-case (str treasury)))
+          {:ok? false :reason :wrong-recipient :onchain onchain}
+
+          (< (:micros entry) (* (double usd) usdc-per-usd 1e6))
+          {:ok? false :reason :underpaid :onchain onchain}
+
+          (< confs min-confirmations)
+          {:ok? false :reason :insufficient-confirmations :onchain onchain}
+
+          :else {:ok? true :reason :confirmed :onchain onchain})))))
