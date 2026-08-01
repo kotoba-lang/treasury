@@ -172,3 +172,103 @@
            (:problem (t/verify-recipient-deployed
                       {:address "0xabc" :chain "base" :expect-contract? false}
                       "0x6080"))))))
+
+;; ── materialized view (ADR-2608010000) ──────────────────────────────
+
+(def ^:private usdc-base "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+(def ^:private TREASURY "0xA00366234D29d4F882088048c0B2fa0dB7302D4E")
+(def ^:private xfer "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
+(defn- topic-of [addr] (str "0x000000000000000000000000" (subs addr 2)))
+
+(defn- hex [n]
+  ;; portable: Long/toHexString is static on the JVM, .toString takes a radix in JS
+  #?(:clj (Long/toHexString (long n)) :cljs (.toString n 16)))
+
+(defn- log-of [{:keys [contract from to micros block tx topic]}]
+  {"address" (or contract usdc-base)
+   "topics" [(or topic xfer) (topic-of from) (topic-of to)]
+   "data" (str "0x" (hex micros))
+   "blockNumber" (str "0x" (hex block))
+   "transactionHash" tx})
+
+(def ^:private real-log
+  (log-of {:from "0xe255D68563C974ac061484cEce4E57de02a4E0Da" :to TREASURY
+           :micros 100000 :block 49351743 :tx "0x50c58ac4"}))
+
+(def ^:private view-opts {:chain "base" :watched #{TREASURY} :from-block 49351000 :to-block 49352000})
+
+(deftest view-admits-only-real-usdc-transfers-to-watched-addresses
+  (let [logs [real-log
+              ;; a worthless token whose symbol is "USDC" — wrong contract
+              (log-of {:contract "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                       :from "0xe255D68563C974ac061484cEce4E57de02a4E0Da" :to TREASURY
+                       :micros 999999999 :block 49351744 :tx "0xfake"})
+              ;; right contract, but not a Transfer
+              (log-of {:topic "0x1111111111111111111111111111111111111111111111111111111111111111"
+                       :from "0xe255D68563C974ac061484cEce4E57de02a4E0Da" :to TREASURY
+                       :micros 500000 :block 49351745 :tx "0xnottransfer"})
+              ;; real transfer, but to someone we do not watch
+              (log-of {:from "0xe255D68563C974ac061484cEce4E57de02a4E0Da"
+                       :to "0x1111111111111111111111111111111111111111"
+                       :micros 700000 :block 49351746 :tx "0xnotours"})]
+        v (t/logs->view logs view-opts)]
+    (is (= 1 (count (:entries v))) "only the genuine watched USDC Transfer survives")
+    (is (= "0x50c58ac4" (:tx (first (:entries v)))))
+    (is (= 100000 (:micros (first (:entries v)))))))
+
+(deftest view-digest-is-canonical-not-arrival-ordered
+  (testing "the same facts arriving in any order digest identically — this is
+            what makes the digest usable as a memo key"
+    (let [a (log-of {:from "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" :to TREASURY
+                     :micros 10000 :block 49351100 :tx "0xaa"})
+          b (log-of {:from "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" :to TREASURY
+                     :micros 20000 :block 49351200 :tx "0xbb"})]
+      (is (= (t/view-digest (t/logs->view [a b] view-opts))
+             (t/view-digest (t/logs->view [b a] view-opts))))))
+  (testing "and a different range is a different key even with the same entries"
+    (is (not= (t/view-digest (t/logs->view [real-log] view-opts))
+              (t/view-digest (t/logs->view [real-log] (assoc view-opts :to-block 49353000)))))))
+
+(deftest absent-from-the-view-is-never-reported-as-absent-from-the-chain
+  (testing "THE invariant: :not-in-view, never :not-found. A view is incomplete
+            by construction, so its silence is not evidence about the chain —
+            and telling a payer their transaction does not exist is the exact
+            production defect this design removes"
+    (let [v (t/logs->view [real-log] view-opts)
+          r (t/verify-from-view v {:tx "0xsomethingelse" :treasury TREASURY :usd 0.01
+                                   :head-block 49351800})]
+      (is (false? (:ok? r)))
+      (is (= :not-in-view (:reason r)))
+      (is (not= :tx-not-found (:reason r)))))
+  (testing "view-covers? is the only thing that can qualify that silence, and it
+            needs a block — which is precisely what a miss does not give us"
+    (let [v (t/logs->view [real-log] view-opts)]
+      (is (true? (t/view-covers? v 49351743)))
+      (is (false? (t/view-covers? v 49999999)) "outside the range")
+      (is (false? (t/view-covers? v nil)) "unknown position is not covered"))))
+
+(deftest verify-from-view-matches-the-live-path-on-the-real-payment
+  (let [v (t/logs->view [real-log] view-opts)
+        r (t/verify-from-view v {:tx "0x50c58ac4" :treasury TREASURY :usd 0.01
+                                 :head-block 49351800 :min-confirmations 3})]
+    (is (true? (:ok? r)))
+    (is (= :confirmed (:reason r)))
+    (is (= 0.1 (:amount (:onchain r))) "100000 micros = 0.1 USDC")
+    (is (= "USDC" (:asset (:onchain r))))))
+
+(deftest conclusive-failures-are-distinguished-from-inconclusive-ones
+  (let [v (t/logs->view [real-log] view-opts)
+        base {:tx "0x50c58ac4" :treasury TREASURY :usd 0.01 :head-block 49351800}]
+    (testing "underpaid is CONCLUSIVE — the view has the entry and it is short"
+      (is (= :underpaid (:reason (t/verify-from-view v (assoc base :usd 10.0))))))
+    (testing "wrong recipient is conclusive"
+      (is (= :wrong-recipient
+             (:reason (t/verify-from-view v (assoc base :treasury "0x9999999999999999999999999999999999999999"))))))
+    (testing "too few confirmations is conclusive-for-now"
+      (is (= :insufficient-confirmations
+             (:reason (t/verify-from-view v (assoc base :head-block 49351743 :min-confirmations 10))))))
+    (testing "none of these are :not-in-view — the caller must not re-ask a node"
+      (doseq [o [(assoc base :usd 10.0)
+                 (assoc base :treasury "0x9999999999999999999999999999999999999999")]]
+        (is (not= :not-in-view (:reason (t/verify-from-view v o))))))))
