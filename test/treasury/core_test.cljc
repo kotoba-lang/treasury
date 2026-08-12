@@ -272,3 +272,23 @@
       (doseq [o [(assoc base :usd 10.0)
                  (assoc base :treasury "0x9999999999999999999999999999999999999999")]]
         (is (not= :not-in-view (:reason (t/verify-from-view v o))))))))
+
+;; ── RPC fallback ordering ────────────────────────────────────────────────
+;; Ported from network-awai/nexus-x402, where this lived as a LOCAL edit to a
+;; vendored copy of this file (com-junkawasaki/root ADR-2608130700). A local
+;; edit to a vendored copy is invisible to everyone else running the same
+;; verify path, and it makes the copy unverifiable against any upstream commit.
+
+(deftest chain-rpcs-base-has-fallbacks
+  (testing "primary rpc first, then distinct fallbacks"
+    (let [rpcs (t/chain-rpcs "base")]
+      (is (= "https://mainnet.base.org" (first rpcs)))
+      (is (some #{"https://1rpc.io/base"} rpcs))
+      (is (some #{"https://base.meowrpc.com"} rpcs))
+      (is (= (count rpcs) (count (distinct rpcs)))))))
+
+(deftest chain-rpcs-degrades-to-a-single-endpoint
+  (testing "a chain with no :rpcs still yields its primary, not an empty list"
+    (is (= ["https://arbitrum-one-rpc.publicnode.com"] (t/chain-rpcs "arbitrum"))))
+  (testing "an unknown chain falls back to the default chain's endpoints"
+    (is (= (t/chain-rpcs t/default-chain) (t/chain-rpcs "no-such-chain")))))
