@@ -41,9 +41,13 @@
                :explorer-api "https://api.basescan.org/api"
                ;; keyless JSON-RPC verify path (receipt->onchain). Preferred over
                ;; the explorer API — Basescan V1 is deprecated and Etherscan V2
-               ;; requires a PAID plan for Base (chainid 8453). Base's public RPC
-               ;; is keyless + free (ADR-2607093100 verify-path robustness).
+               ;; requires a PAID plan for Base (chainid 8453). Primary + fallbacks
+               ;; because Cloudflare Workers sometimes get 403/empty from a single
+               ;; public endpoint (ADR-2607093100 verify-path robustness).
                :rpc "https://mainnet.base.org"
+               :rpcs ["https://1rpc.io/base"
+                      "https://base.meowrpc.com"
+                      "https://base-rpc.publicnode.com"]
                :fee-hint "gas 数セント — 少額決済向き"}
    "arbitrum" {:chain "arbitrum" :usdc "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
                :explorer-api "https://api.arbiscan.io/api"
@@ -56,6 +60,23 @@
 
 (def default-chain "ethereum")
 (defn chain-cfg [chain] (get chains (or chain default-chain) (get chains default-chain)))
+
+(defn chain-rpcs
+  "Ordered keyless JSON-RPC endpoints for `chain`. Primary `:rpc` first, then
+  any `:rpcs` fallbacks (deduped, blanks dropped). Host code should try these
+  in order until eth_getTransactionReceipt returns a receipt.
+
+  Exists because a single public endpoint is not a reliable oracle: measured on
+  nexus-x402 (network-awai/nexus-x402#12), Cloudflare Workers intermittently
+  get 403 or an empty result from one Base RPC, and `receipt->onchain` then
+  sees no receipt — which this library's callers report to the payer as
+  `the transaction does not exist`. A paid buyer being told their payment is
+  not real is the same failure ADR-2608010000's materialized view exists to
+  remove; this is the cheap half of that fix, and it belongs here rather than
+  in each host, because every host that verifies a Base payment needs it."
+  [chain]
+  (let [{:keys [rpc rpcs]} (chain-cfg chain)]
+    (into [] (distinct (remove #(or (nil? %) (= % "")) (cons rpc (or rpcs [])))))))
 
 (def crypto-asset {:asset "USDC" :decimals 6 :custody "safe-multisig"})
 (def usdc-per-usd 1)
